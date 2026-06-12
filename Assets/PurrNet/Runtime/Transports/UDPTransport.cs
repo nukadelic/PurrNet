@@ -389,11 +389,43 @@ namespace PurrNet.Transports
                 }
                 else
                 {
+                    if (IsUdpPortInUse(port))
+                    {
+                        PurrLogger.LogError(
+                            $"Failed to start server: UDP port {port} is already in use by another socket. " +
+                            "If you are running multiple instances on this machine (e.g. testing host migration " +
+                            "with an editor and standalone builds), only one of them can act as server on this port — " +
+                            "check the NetworkManager Start Flags so the others start as client only, or give each " +
+                            "instance a different Server Port.", this);
+                    }
+
                     listenerState = ConnectionState.Disconnecting;
                     TriggerConnectionStateEvent(true);
                     listenerState = ConnectionState.Disconnected;
                     TriggerConnectionStateEvent(true);
                 }
+            }
+        }
+
+        private static bool IsUdpPortInUse(ushort port)
+        {
+            try
+            {
+                using var probe = new System.Net.Sockets.Socket(
+                    System.Net.Sockets.AddressFamily.InterNetwork,
+                    System.Net.Sockets.SocketType.Dgram,
+                    System.Net.Sockets.ProtocolType.Udp);
+                probe.ExclusiveAddressUse = true;
+                probe.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Any, port));
+                return false;
+            }
+            catch (System.Net.Sockets.SocketException e)
+            {
+                return e.SocketErrorCode == System.Net.Sockets.SocketError.AddressAlreadyInUse;
+            }
+            catch
+            {
+                return false;
             }
         }
 

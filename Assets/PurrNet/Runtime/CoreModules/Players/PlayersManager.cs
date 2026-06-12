@@ -371,10 +371,21 @@ namespace PurrNet.Modules
             return _playerIdToCookie.TryGetValue(playerId, out cookie);
         }
 
+        private static string Trim(string cookie) =>
+            string.IsNullOrEmpty(cookie) ? "<null>" : (cookie.Length <= 8 ? cookie : cookie.Substring(0, 8));
+
         private void OnClientAuthed(Connection conn, AuthenticationResponse data)
         {
-            if (data.cookie == null || !_cookieToPlayerId.TryGetValue(data.cookie, out var playerId))
+            PlayerID playerId;
+            bool reclaimedExisting;
+
+            if (data.cookie != null && _cookieToPlayerId.TryGetValue(data.cookie, out playerId))
             {
+                reclaimedExisting = true;
+            }
+            else
+            {
+                reclaimedExisting = false;
                 playerId = new PlayerID(++_playerIdCounter, false);
 
                 if (data.cookie != null)
@@ -382,6 +393,13 @@ namespace PurrNet.Modules
                     _cookieToPlayerId.Add(data.cookie, playerId);
                     _playerIdToCookie.Add(playerId, data.cookie);
                 }
+            }
+
+            if (_networkManager.networkRules && _networkManager.networkRules.IsHostMigrationEnabled())
+            {
+                PurrLogger.Log(reclaimedExisting
+                    ? $"[HostMigration] conn {conn} authed with known cookie '{Trim(data.cookie)}' → reclaimed existing {playerId}."
+                    : $"[HostMigration] conn {conn} authed with cookie '{Trim(data.cookie)}' (known cookies: {_cookieToPlayerId.Count}) → minted NEW {playerId}.");
             }
 
             if (_players.Contains(playerId))

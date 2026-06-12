@@ -331,8 +331,15 @@ namespace LiteNetLib
         /// </param>
         public bool Start(IPAddress addressIPv4, IPAddress addressIPv6, int port, bool manualMode)
         {
-            if (IsRunning && NotConnected == false)
-                return false;
+            if (IsRunning)
+            {
+                if (NotConnected == false)
+                    return false;
+
+                //Restarting over a dead socket (e.g. after app pause): release the old
+                //sockets first, otherwise the new bind fails with AddressAlreadyInUse.
+                CloseSocket();
+            }
 
             NotConnected = false;
             _manualMode = manualMode;

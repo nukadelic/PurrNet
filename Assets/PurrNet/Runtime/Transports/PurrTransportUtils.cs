@@ -127,12 +127,12 @@ namespace PurrNet.Transports
 #endif
         }
 
-        internal static async Task<HostJoinInfo> Alloc(string server, string region, string roomName, CancellationTokenSource cts)
+        internal static async Task<HostJoinInfo> Alloc(string server, string region, string roomName, bool persistent, CancellationTokenSource cts)
         {
-            return await Retry<HostJoinInfo>(10, () => ActualAlloc(server, region, roomName), cts);
+            return await Retry<HostJoinInfo>(10, () => ActualAlloc(server, region, roomName, persistent), cts);
         }
 
-        private static async Task<HostJoinInfo> ActualAlloc(string server, string region, string roomName)
+        private static async Task<HostJoinInfo> ActualAlloc(string server, string region, string roomName, bool persistent)
         {
             if (!server.EndsWith("/"))
                 server += "/";
@@ -144,6 +144,8 @@ namespace PurrNet.Transports
             request.SetRequestHeader("Cache-Control", "no-cache");
             request.SetRequestHeader("region", region);
             request.SetRequestHeader("name", roomName);
+            if (persistent)
+                request.SetRequestHeader("persistent", "true");
             var response = await request.SendWebRequest();
 
             if (response.webRequest.result != UnityWebRequest.Result.Success)

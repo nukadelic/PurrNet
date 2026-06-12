@@ -153,9 +153,22 @@ namespace PurrNet
                 return;
 
             bool isDestroyOnDisconnectEnabled = main.networkRules.ShouldDespawnOnOwnerDisconnect();
-            if (!_ignoreNetworkRules && !isDestroyOnDisconnectEnabled && main.TryGetModule(out GlobalOwnershipModule ownership, true) &&
-                ownership.PlayerOwnsSomething(player))
-                return;
+            bool migrationLogging = main.networkRules && main.networkRules.IsHostMigrationEnabled();
+            if (!_ignoreNetworkRules && !isDestroyOnDisconnectEnabled && main.TryGetModule(out GlobalOwnershipModule ownership, true))
+            {
+                bool ownsSomething = ownership.PlayerOwnsSomething(player);
+                if (migrationLogging)
+                    PurrLogger.Log($"[HostMigration] PlayerSpawner scene-load for {player}: ownsSomething={ownsSomething} → " +
+                                   (ownsSomething ? "reclaim (skip spawn)." : "no owned objects, spawning a fresh prefab."), this);
+
+                if (ownsSomething)
+                    return;
+            }
+            else if (migrationLogging)
+            {
+                PurrLogger.Log($"[HostMigration] PlayerSpawner scene-load for {player}: reclaim gate skipped " +
+                               $"(ignoreRules={_ignoreNetworkRules}, despawnOnDisconnect={isDestroyOnDisconnectEnabled}); spawning.", this);
+            }
 
             GameObject newPlayer;
 

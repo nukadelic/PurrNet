@@ -116,6 +116,14 @@ namespace PurrNet.Modules
                 else
                 {
                     var cookie = _cookiesModule.GetOrSet("client_connection_session", Guid.NewGuid().ToString());
+
+                    if (_manager.networkRules && _manager.networkRules.IsHostMigrationEnabled())
+                    {
+                        var shortCookie = string.IsNullOrEmpty(cookie) ? "<null>" :
+                            (cookie.Length <= 8 ? cookie : cookie.Substring(0, 8));
+                        PurrLogger.Log($"[HostMigration] client sending auth cookie '{shortCookie}' to (new) server.");
+                    }
+
                     _broadcastModule.SendToServer(new AuthenticationRequest
                     {
                         cookie = cookie,

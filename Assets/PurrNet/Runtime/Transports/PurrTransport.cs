@@ -26,15 +26,40 @@ namespace PurrNet.Transports
             SERVER_AUTHENTICATED = 3,
             SERVER_AUTHENTICATION_FAILED = 4,
             SERVER_PIPE_AUTHENTICATED = 5,
-            SERVER_NAT_INTRODUCE = 6
+            SERVER_NAT_INTRODUCE = 6,
+            SERVER_HOST_LOST = 7,
+            SERVER_PROMOTE_TO_HOST = 8,
+            SERVER_SNAPSHOT_BEGIN = 9,
+            SERVER_SNAPSHOT_CHUNK = 10,
+            SERVER_SNAPSHOT_COMMIT = 11,
+            SERVER_HOST_MIGRATED = 12
         }
 
         enum HOST_PACKET_TYPE : byte
         {
             SEND_KEEPALIVE = 0,
             SEND_ONE = 1,
-            KICK_PLAYER = 2
+            KICK_PLAYER = 2,
+            SNAPSHOT_BEGIN = 3,
+            SNAPSHOT_CHUNK = 4,
+            SNAPSHOT_COMMIT = 5,
+            SNAPSHOT_CLEAR = 6,
+            MIGRATION_READY = 7
         }
+
+        /// <summary>
+        /// Relay protocol version sent during authentication when persistent rooms are
+        /// enabled. Version 1 keeps the relay→client receive path framed after
+        /// authentication (every packet starts with a SERVER_PACKET_TYPE byte), which is
+        /// what makes the host-migration control packets possible.
+        /// </summary>
+        const int RELAY_PROTOCOL_VERSION = 1;
+
+        /// <summary>Magic prefix of MIGRATION_READY ("PRMG"), mirrored by the relay.</summary>
+        const uint MIGRATION_READY_MAGIC = 0x50524D47;
+
+        /// <summary>Chunk size used when uploading a room snapshot to the relay.</summary>
+        const int SNAPSHOT_CHUNK_SIZE = 8 * 1024;
 
         [Serializable, UsedImplicitly]
         private struct ClientAuthenticate
@@ -42,6 +67,7 @@ namespace PurrNet.Transports
             public string roomName;
             public string clientSecret;
             public bool nat;
+            public int protocolVersion;
         }
 
         [Header("Remote Settings")]
@@ -60,6 +86,26 @@ namespace PurrNet.Transports
                  "lost the session is disconnected cleanly.")]
         [SerializeField, HideInInspector] private bool _useNat;
         [SerializeField, HideInInspector] private float _natResolveTimeout = 8f;
+
+        [Tooltip("Persistent rooms survive host loss: the relay keeps the room (and an optional " +
+                 "host-uploaded state snapshot) alive and promotes a surviving client to host. " +
+                 "Requires a relay that supports protocol v1.")]
+        [SerializeField, HideInInspector] private bool _persistentRoom;
+
+        [Tooltip("When this peer is elected as the new host, automatically run " +
+                 "NetworkManager.PromoteToServer(). Disable to drive promotion manually " +
+                 "via the onPromotedToHost event.")]
+        [SerializeField, HideInInspector] private bool _autoPromoteToHost = true;
+
+        [Tooltip("When the room migrated to a new host, automatically run " +
+                 "NetworkManager.TransferToNewServer(). Disable to drive the transfer manually " +
+                 "via the onHostMigrated event.")]
+        [SerializeField, HideInInspector] private bool _autoTransferOnMigration = true;
+
+        [Tooltip("Automatically report MIGRATION_READY to the relay right after promotion. " +
+                 "Disable if a state-restore step (e.g. a persistence module) should decide " +
+                 "when the new host is ready, then call SendMigrationReady() manually.")]
+        [SerializeField, HideInInspector] private bool _autoSendMigrationReady = true;
 
         [SerializeField, HideInInspector] private NetworkSimulation _networkSimulation = NetworkSimulation.@default;
 
@@ -93,6 +139,91 @@ namespace PurrNet.Transports
         {
             get => _useNat;
             set => _useNat = value;
+        }
+
+        /// <summary>
+        /// Whether the room should be allocated as persistent (survives host loss via
+        /// relay-side host migration). Requires a protocol v1 relay.
+        /// </summary>
+        public bool persistentRoom
+        {
+            get => _persistentRoom;
+            set => _persistentRoom = value;
+        }
+
+        /// <summary>See the matching inspector toggle: auto-run PromoteToServer when elected.</summary>
+        public bool autoPromoteToHost
+        {
+            get => _autoPromoteToHost;
+            set => _autoPromoteToHost = value;
+        }
+
+        /// <summary>See the matching inspector toggle: auto-run TransferToNewServer on migration.</summary>
+        public bool autoTransferOnMigration
+        {
+            get => _autoTransferOnMigration;
+            set => _autoTransferOnMigration = value;
+        }
+
+        /// <summary>See the matching inspector toggle: auto-send MIGRATION_READY after promotion.</summary>
+        public bool autoSendMigrationReady
+        {
+            get => _autoSendMigrationReady;
+            set => _autoSendMigrationReady = value;
+        }
+
+        /// <summary>Raised when the room host was lost and the relay opened a migration window. The session is paused.</summary>
+        public event Action onHostLost;
+
+        /// <summary>Raised when the relay elected this peer as the new host (arg: whether a room snapshot will follow).</summary>
+        public event Action<bool> onPromotedToHost;
+
+        /// <summary>Raised when the room finished migrating to a new host (arg: new host relay connId). The session resumes.</summary>
+        public event Action<int> onHostMigrated;
+
+        /// <summary>Raised when a room snapshot finished downloading (args: data, version). Also fires for hosts resuming a dormant room.</summary>
+        public event Action<byte[], uint> onRoomSnapshotReceived;
+
+        // --- host migration / persistent room state ---
+        private bool _framedClientSession;   // protocol v1: relay→client packets stay framed after auth
+        private bool _sessionPaused;         // between SERVER_HOST_LOST and SERVER_HOST_MIGRATED
+        private bool _pendingPromotion;      // got SERVER_PROMOTE_TO_HOST, waiting for promoted Listen()
+        private bool _promotedHostMode;      // acting as room host over the adopted client socket
+        private bool _promotedFlushPending;  // surface inherited connections + MIGRATION_READY next tick
+        private bool _promotionHasSnapshot;
+        private string _promotedHostSecret;
+        private readonly List<int> _pendingPromotionClients = new List<int>();
+
+        // --- room snapshot download (assembled from SERVER_SNAPSHOT_* packets) ---
+        private byte[] _snapshotDownloadBuffer;
+        private uint _snapshotDownloadVersion;
+        private int _snapshotDownloadReceived;
+        private int _snapshotDownloadChunks;
+        private int _snapshotDownloadChunksReceived;
+        private byte[] _roomSnapshot;
+        private uint _roomSnapshotVersion;
+
+        /// <summary>True while the session is paused by a host-migration window.</summary>
+        public bool isSessionPaused => _sessionPaused;
+
+        /// <summary>True when this peer acts as the room host after a relay-side promotion.</summary>
+        public bool isPromotedHost => _promotedHostMode;
+
+        /// <summary>
+        /// Latest fully downloaded room snapshot (from a promotion or a dormant-room resume).
+        /// </summary>
+        public bool TryGetRoomSnapshot(out byte[] data, out uint version)
+        {
+            data = _roomSnapshot;
+            version = _roomSnapshotVersion;
+            return data != null;
+        }
+
+        /// <summary>Drops the locally cached room snapshot.</summary>
+        public void ClearLocalRoomSnapshot()
+        {
+            _roomSnapshot = null;
+            _roomSnapshotVersion = 0;
         }
 
         /// <summary>Which link a session is running over: the relay or a direct NAT-punched P2P link.</summary>
@@ -228,9 +359,11 @@ namespace PurrNet.Transports
                 try
                 {
                     var method = UDPTransport.ToDeliveryMethod(channel);
-                    var result = asServer ?
-                        _udpServer.FirstPeer.GetMaxSinglePacketSize(method) :
-                        _udpClient.FirstPeer.GetMaxSinglePacketSize(method);
+                    // A promoted host's link lives on the client-side manager.
+                    var peer = asServer
+                        ? (_promotedHostMode ? _relayServerPeer : _udpServer.FirstPeer)
+                        : _udpClient.FirstPeer;
+                    var result = peer.GetMaxSinglePacketSize(method);
                     return result - 16; // give the relay some space for metadata
                 }
                 catch
@@ -614,6 +747,15 @@ namespace PurrNet.Transports
                     }
                     break;
                 }
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_BEGIN:
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_CHUNK:
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_COMMIT:
+                {
+                    // A host resuming a dormant persistent room receives the stored
+                    // snapshot right after SERVER_AUTHENTICATED.
+                    HandleSnapshotPacket(type, data);
+                    break;
+                }
                 default:
                     PurrLogger.LogError($"Unexpected packet type {type} from server");
                     break;
@@ -622,6 +764,11 @@ namespace PurrNet.Transports
 
         private void OnClientOrPipeConnectedUDP(NetPeer peer)
         {
+            // The promoted host link lives on the client-side manager — never treat it
+            // as a client/pipe/P2P peer.
+            if (_promotedHostMode && ReferenceEquals(peer, _relayServerPeer))
+                return;
+
             if (_isPipeMode)
             {
                 OnPipeConnected();
@@ -651,6 +798,13 @@ namespace PurrNet.Transports
 
         private void OnClientOrPipeDisconnectedUDP(NetPeer peer, DisconnectInfo info)
         {
+            // The promoted host link died — bring down the whole listener.
+            if (_promotedHostMode && ReferenceEquals(peer, _relayServerPeer))
+            {
+                StopListening();
+                return;
+            }
+
             if (_isPipeMode)
             {
                 OnPipeDisconnectedUDP();
@@ -667,7 +821,13 @@ namespace PurrNet.Transports
                 if (_p2pHostEstablished)
                 {
                     _p2pHostEstablished = false;
-                    Disconnect();
+                    _clientP2pSession = false;
+
+                    // During a migration window the P2P host link dying is expected (the
+                    // host is gone) — the relay link carries the migration, so don't tear
+                    // the session down.
+                    if (!_sessionPaused && !_pendingPromotion)
+                        Disconnect();
                 }
                 else if (_clientConnPending)
                 {
@@ -682,6 +842,15 @@ namespace PurrNet.Transports
         private void OnClientOrPipeDataUDP(NetPeer peer, NetPacketReader reader, byte channel, DeliveryMethod deliveryMethod)
         {
             var data = reader.GetRemainingBytesSegment();
+
+            // Data on the promoted host link is host-side traffic (no P2P peers exist
+            // in promoted mode, so it goes straight to the relay frame parser).
+            if (_promotedHostMode && ReferenceEquals(peer, _relayServerPeer))
+            {
+                OnHostData(data);
+                return;
+            }
+
             if (_isPipeMode)
             {
                 OnPipeData(data);
@@ -715,11 +884,27 @@ namespace PurrNet.Transports
             if (data.Array == null || data.Count == 0)
                 return;
 
+            // A promotion is in flight: the socket is about to become the host link and
+            // only relay control packets (snapshot stream, room client list) are expected,
+            // regardless of the client session state.
+            if (_pendingPromotion)
+            {
+                HandleFramedClientPacket(data);
+                return;
+            }
+
             if (_clientConnPending)
                 ResolveClientConn(false);
 
             if (clientState == ConnectionState.Connected)
             {
+                if (_framedClientSession)
+                {
+                    // Protocol v1: every relay→client packet stays framed after auth.
+                    HandleFramedClientPacket(data);
+                    return;
+                }
+
                 var bdata = new ByteData(data.Array, data.Offset, data.Count);
                 RaiseDataReceived(new Connection(0), bdata, false);
                 return;
@@ -757,12 +942,303 @@ namespace PurrNet.Transports
             }
         }
 
+        /// <summary>
+        /// Handles a framed relay→client packet (protocol v1 sessions and promotions in
+        /// flight): game data is wrapped as [SERVER_CLIENT_DATA][payload] and host-migration
+        /// control packets are dispatched here.
+        /// </summary>
+        private void HandleFramedClientPacket(ArraySegment<byte> data)
+        {
+            var type = (SERVER_PACKET_TYPE)data.Array[data.Offset];
+
+            switch (type)
+            {
+                case SERVER_PACKET_TYPE.SERVER_CLIENT_DATA:
+                {
+                    if (_pendingPromotion || _sessionPaused || clientState != ConnectionState.Connected)
+                        return;
+
+                    if (data.Count <= 1)
+                        return;
+
+                    RaiseDataReceived(new Connection(0),
+                        new ByteData(data.Array, data.Offset + 1, data.Count - 1), false);
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_HOST_LOST:
+                {
+                    // The relay opened a migration window. Pause instead of disconnecting:
+                    // either we get promoted or SERVER_HOST_MIGRATED resumes the session.
+                    _sessionPaused = true;
+                    PurrLogger.Log("PurrTransport: room host lost, session paused while a new host is elected.");
+                    onHostLost?.Invoke();
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_PROMOTE_TO_HOST:
+                {
+                    // [hasSnapshot(1)][newHostSecret(UTF8, remaining)]
+                    if (data.Count < 2)
+                        return;
+
+                    _promotionHasSnapshot = data.Array[data.Offset + 1] != 0;
+                    _promotedHostSecret = data.Count > 2
+                        ? Encoding.UTF8.GetString(data.Array, data.Offset + 2, data.Count - 2)
+                        : null;
+
+                    _pendingPromotion = true;
+                    _sessionPaused = true;
+                    _pendingPromotionClients.Clear();
+
+                    PurrLogger.Log($"PurrTransport: elected as new room host (snapshot incoming: {_promotionHasSnapshot}).");
+
+                    // With a snapshot, promotion is announced once the download commits.
+                    if (!_promotionHasSnapshot)
+                        AnnouncePromotion();
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_BEGIN:
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_CHUNK:
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_COMMIT:
+                {
+                    HandleSnapshotPacket(type, data);
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_CLIENT_CONNECTED:
+                {
+                    // Only meaningful mid-promotion: the relay hands us the connIds of the
+                    // room's other clients, which we surface once we run as the host.
+                    if (!_pendingPromotion)
+                        return;
+
+                    int count = (data.Count - 1) / 4;
+                    for (var i = 0; i < count; i++)
+                    {
+                        int offset = data.Offset + 1 + i * 4;
+                        int connId = data.Array[offset] |
+                                     data.Array[offset + 1] << 8 |
+                                     data.Array[offset + 2] << 16 |
+                                     data.Array[offset + 3] << 24;
+
+                        if (!_pendingPromotionClients.Contains(connId))
+                            _pendingPromotionClients.Add(connId);
+                    }
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_CLIENT_DISCONNECTED:
+                {
+                    if (!_pendingPromotion || data.Count < 5)
+                        return;
+
+                    int connId = data.Array[data.Offset + 1] |
+                                 data.Array[data.Offset + 2] << 8 |
+                                 data.Array[data.Offset + 3] << 16 |
+                                 data.Array[data.Offset + 4] << 24;
+
+                    _pendingPromotionClients.Remove(connId);
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_HOST_MIGRATED:
+                {
+                    // [newHostConnId(4)] — the new host is ready, resume the session.
+                    _sessionPaused = false;
+
+                    int newHostConnId = data.Count >= 5
+                        ? data.Array[data.Offset + 1] |
+                          data.Array[data.Offset + 2] << 8 |
+                          data.Array[data.Offset + 3] << 16 |
+                          data.Array[data.Offset + 4] << 24
+                        : -1;
+
+                    PurrLogger.Log($"PurrTransport: room migrated to new host (relay conn {newHostConnId}), resuming session.");
+                    onHostMigrated?.Invoke(newHostConnId);
+
+                    var nm = NetworkManager.main;
+                    if (_autoTransferOnMigration)
+                    {
+                        if (nm && ReferenceEquals(nm.transport, this))
+                        {
+                            PurrLogger.Log("PurrTransport: auto-transferring via NetworkManager.TransferToNewServer().");
+                            nm.TransferToNewServer();
+                        }
+                        else if (!_promotedHostMode)
+                        {
+                            PurrLogger.LogWarning("PurrTransport: autoTransferOnMigration is on but TransferToNewServer() " +
+                                                  $"was not called (NetworkManager.main: {(nm ? nm.name : "null")}, transport is " +
+                                                  $"this component: {nm && ReferenceEquals(nm.transport, this)}).");
+                        }
+                    }
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_AUTHENTICATED:
+                case SERVER_PACKET_TYPE.SERVER_NAT_INTRODUCE:
+                    // Late/duplicate control packets — nothing to do post-auth.
+                    return;
+                default:
+                    PurrLogger.LogError($"Unexpected framed packet type {type} from relay");
+                    return;
+            }
+        }
+
+        /// <summary>
+        /// Announces this peer as the new room host. With auto-promotion enabled this runs
+        /// NetworkManager.PromoteToServer(), whose StartServer() lands in PromotedListen().
+        /// </summary>
+        private void AnnouncePromotion()
+        {
+            onPromotedToHost?.Invoke(_promotionHasSnapshot);
+
+            if (!_autoPromoteToHost)
+                return;
+
+            var nm = NetworkManager.main;
+            if (nm && ReferenceEquals(nm.transport, this))
+            {
+                PurrLogger.Log("PurrTransport: auto-promoting via NetworkManager.PromoteToServer().");
+                nm.PromoteToServer();
+            }
+            else
+            {
+                PurrLogger.LogWarning("PurrTransport: autoPromoteToHost is on but PromoteToServer() was not called " +
+                                      $"(NetworkManager.main: {(nm ? nm.name : "null")}, transport is this component: " +
+                                      $"{nm && ReferenceEquals(nm.transport, this)}) — promote manually via onPromotedToHost.");
+            }
+        }
+
+        /// <summary>
+        /// Assembles SERVER_SNAPSHOT_BEGIN / CHUNK / COMMIT into a room snapshot. Used by
+        /// both the promotion path (client socket) and the dormant-room resume path (host socket).
+        /// </summary>
+        private void HandleSnapshotPacket(SERVER_PACKET_TYPE type, ArraySegment<byte> data)
+        {
+            switch (type)
+            {
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_BEGIN:
+                {
+                    // [version(u32)][totalSize(u32)][chunkCount(u16)]
+                    if (data.Count < 11)
+                        return;
+
+                    _snapshotDownloadVersion = ReadUInt(data.Array, data.Offset + 1);
+                    int totalSize = (int)ReadUInt(data.Array, data.Offset + 5);
+                    _snapshotDownloadChunks = data.Array[data.Offset + 9] | data.Array[data.Offset + 10] << 8;
+
+                    if (totalSize <= 0)
+                    {
+                        ResetSnapshotDownload();
+                        return;
+                    }
+
+                    _snapshotDownloadBuffer = new byte[totalSize];
+                    _snapshotDownloadReceived = 0;
+                    _snapshotDownloadChunksReceived = 0;
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_CHUNK:
+                {
+                    // [chunkIndex(u16)][bytes...] — reliable-ordered, so always in order.
+                    if (_snapshotDownloadBuffer == null || data.Count < 4)
+                        return;
+
+                    int payload = data.Count - 3;
+                    if (_snapshotDownloadReceived + payload > _snapshotDownloadBuffer.Length)
+                    {
+                        ResetSnapshotDownload();
+                        return;
+                    }
+
+                    Buffer.BlockCopy(data.Array, data.Offset + 3,
+                        _snapshotDownloadBuffer, _snapshotDownloadReceived, payload);
+                    _snapshotDownloadReceived += payload;
+                    _snapshotDownloadChunksReceived++;
+                    return;
+                }
+                case SERVER_PACKET_TYPE.SERVER_SNAPSHOT_COMMIT:
+                {
+                    // [version(u32)][crc32(u32)]
+                    if (data.Count < 9)
+                        return;
+
+                    var version = ReadUInt(data.Array, data.Offset + 1);
+                    var crc = ReadUInt(data.Array, data.Offset + 5);
+
+                    bool valid = _snapshotDownloadBuffer != null &&
+                                 version == _snapshotDownloadVersion &&
+                                 _snapshotDownloadReceived == _snapshotDownloadBuffer.Length &&
+                                 _snapshotDownloadChunksReceived == _snapshotDownloadChunks &&
+                                 Crc32(_snapshotDownloadBuffer, 0, _snapshotDownloadBuffer.Length) == crc;
+
+                    if (valid)
+                    {
+                        _roomSnapshot = _snapshotDownloadBuffer;
+                        _roomSnapshotVersion = version;
+                        PurrLogger.Log($"PurrTransport: room snapshot v{version} downloaded ({_roomSnapshot.Length} bytes).");
+                        onRoomSnapshotReceived?.Invoke(_roomSnapshot, version);
+                    }
+                    else
+                    {
+                        PurrLogger.LogError("PurrTransport: room snapshot download failed validation, discarding.");
+                        _promotionHasSnapshot = false;
+                    }
+
+                    _snapshotDownloadBuffer = null;
+                    _snapshotDownloadReceived = 0;
+                    _snapshotDownloadChunks = 0;
+                    _snapshotDownloadChunksReceived = 0;
+
+                    if (_pendingPromotion)
+                        AnnouncePromotion();
+                    return;
+                }
+            }
+        }
+
+        private void ResetSnapshotDownload()
+        {
+            _snapshotDownloadBuffer = null;
+            _snapshotDownloadVersion = 0;
+            _snapshotDownloadReceived = 0;
+            _snapshotDownloadChunks = 0;
+            _snapshotDownloadChunksReceived = 0;
+        }
+
+        static uint[] _crcTable;
+
+        /// <summary>Standard CRC-32 (IEEE 802.3), matching the relay's implementation.</summary>
+        static uint Crc32(byte[] data, int offset, int count)
+        {
+            if (_crcTable == null)
+            {
+                _crcTable = new uint[256];
+                for (uint i = 0; i < 256; i++)
+                {
+                    var c = i;
+                    for (var k = 0; k < 8; k++)
+                        c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                    _crcTable[i] = c;
+                }
+            }
+
+            var crc = 0xFFFFFFFFu;
+            for (var i = offset; i < offset + count; i++)
+                crc = _crcTable[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+            return crc ^ 0xFFFFFFFFu;
+        }
+
+        static uint ReadUInt(byte[] data, int offset)
+        {
+            return (uint)(data[offset]
+                          | data[offset + 1] << 8
+                          | data[offset + 2] << 16
+                          | data[offset + 3] << 24);
+        }
+
         private void OnHostConnected()
         {
             var authenticate = new ClientAuthenticate()
             {
                 roomName = _roomName,
-                clientSecret = _hostJoinInfo.secret
+                clientSecret = _hostJoinInfo.secret,
+                protocolVersion = _persistentRoom ? RELAY_PROTOCOL_VERSION : 0
             };
 
             string json = JsonUtility.ToJson(authenticate);
@@ -790,7 +1266,8 @@ namespace PurrNet.Transports
             {
                 roomName = _roomName,
                 clientSecret = _hostJoinInfo.secret,
-                nat = _useNat
+                nat = _useNat,
+                protocolVersion = _persistentRoom ? RELAY_PROTOCOL_VERSION : 0
             };
 
             string json = JsonUtility.ToJson(authenticate);
@@ -804,8 +1281,11 @@ namespace PurrNet.Transports
             var authenticate = new ClientAuthenticate()
             {
                 roomName = _roomName,
-                clientSecret = _clientJoinInfo.secret
+                clientSecret = _clientJoinInfo.secret,
+                protocolVersion = _persistentRoom ? RELAY_PROTOCOL_VERSION : 0
             };
+
+            _framedClientSession = authenticate.protocolVersion >= RELAY_PROTOCOL_VERSION;
 
             string json = JsonUtility.ToJson(authenticate);
             var data = Encoding.UTF8.GetBytes(json);
@@ -819,8 +1299,11 @@ namespace PurrNet.Transports
             {
                 roomName = _roomName,
                 clientSecret = _clientJoinInfo.secret,
-                nat = _useNat
+                nat = _useNat,
+                protocolVersion = _persistentRoom ? RELAY_PROTOCOL_VERSION : 0
             };
+
+            _framedClientSession = authenticate.protocolVersion >= RELAY_PROTOCOL_VERSION;
 
             string json = JsonUtility.ToJson(authenticate);
             var data = Encoding.UTF8.GetBytes(json);
@@ -873,6 +1356,14 @@ namespace PurrNet.Transports
         {
             try
             {
+                // A relay-side promotion is pending: become the host over the existing
+                // socket instead of allocating a new room.
+                if (_pendingPromotion)
+                {
+                    PromotedListen();
+                    return;
+                }
+
                 if (listenerState != ConnectionState.Disconnected)
                     StopListening();
 
@@ -900,7 +1391,7 @@ namespace PurrNet.Transports
                     if (token.IsCancellationRequested)
                         return;
 
-                    _hostJoinInfo = await PurrTransportUtils.Alloc(_masterServer, _region, _roomName, token);
+                    _hostJoinInfo = await PurrTransportUtils.Alloc(_masterServer, _region, _roomName, _persistentRoom, token);
 
                     if (token.IsCancellationRequested)
                         return;
@@ -952,8 +1443,194 @@ namespace PurrNet.Transports
             PurrLogger.LogException(obj);
         }
 
+        /// <summary>
+        /// Completes a relay-side host promotion: adopts the existing client socket as the
+        /// host link (the relay already re-pointed the room host to this connection) and
+        /// brings the listener up without allocating anything.
+        /// </summary>
+        private void PromotedListen()
+        {
+            listenerState = ConnectionState.Connecting;
+
+            if (_isUsingUDP)
+            {
+                // The relay peer simply changes roles; it stays on _udpClient's manager,
+                // which keeps being polled. Incoming routing is handled by the
+                // promoted-peer checks in the client UDP callbacks.
+                _relayServerPeer = _relayClientPeer;
+                _relayClientPeer = null;
+            }
+            else
+            {
+                // Move the WebSocket into the host slot and rewire it to the host handlers,
+                // so every host-side code path works unchanged.
+                _client.onConnect -= OnClientConnected;
+                _client.onData -= OnClientData;
+                _client.onDisconnect -= OnClientDisconnected;
+
+                _server = _client;
+                _client = null;
+
+                _server.onData += OnHostData;
+                _server.onDisconnect += OnHostDisconnected;
+            }
+
+            _hostJoinInfo = new HostJoinInfo { secret = _promotedHostSecret };
+
+            _pendingPromotion = false;
+            _promotedHostMode = true;
+            _sessionPaused = false;
+
+            listenerState = ConnectionState.Connected;
+
+            PurrLogger.Log($"PurrTransport: promotion adopted the relay link as host ({(_isUsingUDP ? "UDP" : "WebSocket")}), " +
+                           $"{_pendingPromotionClients.Count} inherited client(s) pending.");
+
+            // Surface inherited connections and report readiness on the next tick, after
+            // NetworkManager.PromoteToServer() finished migrating the modules.
+            _promotedFlushPending = true;
+        }
+
+        /// <summary>
+        /// Surfaces the room's surviving clients as fresh server connections and (when
+        /// enabled) reports MIGRATION_READY to the relay. Runs one tick after promotion.
+        /// </summary>
+        private void FlushPromotedPromotion()
+        {
+            if (!_promotedFlushPending)
+                return;
+
+            _promotedFlushPending = false;
+
+            for (var i = 0; i < _pendingPromotionClients.Count; i++)
+            {
+                var conn = new Connection(_pendingPromotionClients[i]);
+                if (!_connections.Contains(conn))
+                    _connections.Add(conn);
+                onConnected?.Invoke(conn, true);
+            }
+
+            _pendingPromotionClients.Clear();
+
+            if (_autoSendMigrationReady)
+                SendMigrationReady();
+        }
+
+        /// <summary>
+        /// Tells the relay this promoted host restored state and is ready to serve; the
+        /// relay then broadcasts SERVER_HOST_MIGRATED to the room. Called automatically
+        /// unless <see cref="autoSendMigrationReady"/> is disabled.
+        /// </summary>
+        public void SendMigrationReady()
+        {
+            if (!_promotedHostMode || listenerState != ConnectionState.Connected)
+            {
+                PurrLogger.LogWarning($"PurrTransport: MIGRATION_READY not sent (promotedHost: {_promotedHostMode}, " +
+                                      $"listenerState: {listenerState}) — the relay will time this candidate out.");
+                return;
+            }
+
+            _packer.ResetPositionAndMode(false);
+            Packer<byte>.Write(_packer, (byte)HOST_PACKET_TYPE.MIGRATION_READY);
+            WriteRawUInt(_packer, MIGRATION_READY_MAGIC);
+
+            var data = _packer.ToByteData();
+            SendHostControlPacket(data);
+            PurrLogger.Log("PurrTransport: MIGRATION_READY sent to relay.");
+        }
+
+        /// <summary>
+        /// Uploads an opaque room-state snapshot to the relay's RAM (persistent rooms only).
+        /// The relay hands the latest committed snapshot to the next host on migration or
+        /// dormant-room resume. Returns false when not hosting or the data is empty.
+        /// </summary>
+        public bool UploadRoomSnapshot(byte[] data, uint version)
+        {
+            if (listenerState != ConnectionState.Connected || data == null || data.Length == 0)
+                return false;
+
+            int chunkCount = (data.Length + SNAPSHOT_CHUNK_SIZE - 1) / SNAPSHOT_CHUNK_SIZE;
+
+            if (chunkCount > ushort.MaxValue)
+                return false;
+
+            _packer.ResetPositionAndMode(false);
+            Packer<byte>.Write(_packer, (byte)HOST_PACKET_TYPE.SNAPSHOT_BEGIN);
+            WriteRawUInt(_packer, version);
+            WriteRawUInt(_packer, (uint)data.Length);
+            WriteRawUShort(_packer, (ushort)chunkCount);
+            SendHostControlPacket(_packer.ToByteData());
+
+            for (var i = 0; i < chunkCount; i++)
+            {
+                int offset = i * SNAPSHOT_CHUNK_SIZE;
+                int count = Math.Min(SNAPSHOT_CHUNK_SIZE, data.Length - offset);
+
+                _packer.ResetPositionAndMode(false);
+                Packer<byte>.Write(_packer, (byte)HOST_PACKET_TYPE.SNAPSHOT_CHUNK);
+                WriteRawUInt(_packer, version);
+                WriteRawUShort(_packer, (ushort)i);
+                _packer.WriteBytes(new ByteData(data, offset, count));
+                SendHostControlPacket(_packer.ToByteData());
+            }
+
+            _packer.ResetPositionAndMode(false);
+            Packer<byte>.Write(_packer, (byte)HOST_PACKET_TYPE.SNAPSHOT_COMMIT);
+            WriteRawUInt(_packer, version);
+            WriteRawUInt(_packer, Crc32(data, 0, data.Length));
+            SendHostControlPacket(_packer.ToByteData());
+
+            return true;
+        }
+
+        /// <summary>Clears both the pending and the stored snapshot for the room on the relay.</summary>
+        public void ClearRoomSnapshot()
+        {
+            if (listenerState != ConnectionState.Connected)
+                return;
+
+            _packer.ResetPositionAndMode(false);
+            Packer<byte>.Write(_packer, (byte)HOST_PACKET_TYPE.SNAPSHOT_CLEAR);
+            SendHostControlPacket(_packer.ToByteData());
+        }
+
+        /// <summary>Sends a host-framed control packet over the host link, reliable-ordered.</summary>
+        private void SendHostControlPacket(ByteData data)
+        {
+            if (_isUsingUDP)
+                _relayServerPeer?.Send(data.data, data.offset, data.length, DeliveryMethod.ReliableOrdered);
+            else
+                _server?.Send(new ArraySegment<byte>(data.data, data.offset, data.length));
+        }
+
+        static void WriteRawUInt(BitPacker packer, uint value)
+        {
+            Packer<byte>.Write(packer, (byte)value);
+            Packer<byte>.Write(packer, (byte)(value >> 8));
+            Packer<byte>.Write(packer, (byte)(value >> 16));
+            Packer<byte>.Write(packer, (byte)(value >> 24));
+        }
+
+        static void WriteRawUShort(BitPacker packer, ushort value)
+        {
+            Packer<byte>.Write(packer, (byte)value);
+            Packer<byte>.Write(packer, (byte)(value >> 8));
+        }
+
         public void StopListening()
         {
+            // A promoted host's link lives on the client-side socket — tear that down too.
+            if (_promotedHostMode)
+            {
+                _promotedHostMode = false;
+                _promotedFlushPending = false;
+                _pendingPromotionClients.Clear();
+                _relayServerPeer = null;
+
+                if (_isUsingUDP)
+                    _udpClient?.Stop();
+            }
+
             _connections.Clear();
             CancelAll(true);
 
@@ -983,6 +1660,27 @@ namespace PurrNet.Transports
 
         public void Disconnect()
         {
+            // During a promotion the relay socket must survive — it is about to become the
+            // host link. Only end the client session from PurrNet's point of view.
+            if (_pendingPromotion)
+            {
+                if (clientState != ConnectionState.Disconnected)
+                    onDisconnected?.Invoke(default, DisconnectReason.ClientRequest, false);
+
+                CancelAll(false);
+
+                _p2pHostPeer = null;
+                _clientPunch = null;
+                _clientConnPending = false;
+                _clientP2pSession = false;
+                _p2pHostEstablished = false;
+
+                if (clientState is ConnectionState.Connecting or ConnectionState.Connected)
+                    clientState = ConnectionState.Disconnecting;
+                clientState = ConnectionState.Disconnected;
+                return;
+            }
+
             if (clientState != ConnectionState.Disconnected)
                 onDisconnected?.Invoke(default, DisconnectReason.ClientRequest, false);
 
@@ -997,7 +1695,12 @@ namespace PurrNet.Transports
                 _client.Disconnect();
             }
 
-            _udpClient?.Stop();
+            // A promoted host shares the client-side UDP manager with its local client:
+            // stopping the manager would kill the host link, so only drop the client peer.
+            if (_promotedHostMode)
+                _relayClientPeer?.Disconnect();
+            else
+                _udpClient?.Stop();
 
             _client = null;
             _relayClientPeer = null;
@@ -1006,6 +1709,9 @@ namespace PurrNet.Transports
             _clientConnPending = false;
             _clientP2pSession = false;
             _p2pHostEstablished = false;
+            _framedClientSession = false;
+            _sessionPaused = false;
+            ResetSnapshotDownload();
 
             if (clientState is ConnectionState.Connecting or ConnectionState.Connected)
                 clientState = ConnectionState.Disconnecting;
@@ -1142,6 +1848,10 @@ namespace PurrNet.Transports
         public void SendToServer(ByteData data, Channel method = Channel.ReliableOrdered)
         {
             if (clientState != ConnectionState.Connected)
+                return;
+
+            // While a migration window is open there is no host to receive this.
+            if (_sessionPaused || _pendingPromotion)
                 return;
 
             if (_isUsingUDP)
@@ -1516,6 +2226,8 @@ namespace PurrNet.Transports
 
         public void ReceiveMessages(float delta)
         {
+            FlushPromotedPromotion();
+
             if (!_pollEventsInUpdate)
             {
                 if (_isUsingUDP)
@@ -1536,6 +2248,8 @@ namespace PurrNet.Transports
 
         public void UnityUpdate(float delta)
         {
+            FlushPromotedPromotion();
+
             if (_pollEventsInUpdate)
             {
                 if (_isUsingUDP)

@@ -1109,6 +1109,7 @@ namespace PurrNet
             {
                 case true when isPromotingToServer:
                     modules.MigrateFrom(_clientModules);
+                    AdoptPromotedServerModules(modules);
                     return;
                 case false when isTranferingToNewServer:
                     modules.TransferToNewServer();
@@ -1299,6 +1300,119 @@ namespace PurrNet
 #endif
 
             RenewSubscriptions(asServer);
+        }
+
+        /// <summary>
+        /// MigrateFrom moves the client's module instances into the server collection, but the
+        /// cached server-side lookups (e.g. <see cref="TryGetRpcModule"/>) and the manager-level
+        /// event subscriptions are normally wired by the regular registration path that promotion
+        /// skips. Without this, the promoted host has no server RPCModule, tick events, or player
+        /// callbacks. The client-side fields pointing at the migrated instances are detached so a
+        /// follow-up StartClient builds fresh client modules without touching the promoted ones.
+        /// </summary>
+        private void AdoptPromotedServerModules(ModulesCollection modules)
+        {
+            if (modules.TryGetModule<TickManager>(out var tickManager))
+            {
+                if (_clientTickManager == tickManager)
+                {
+                    _clientTickManager.onPreTick -= OnClientPreTick;
+                    _clientTickManager.onTick -= OnClientTick;
+                    _clientTickManager.onPostTick -= OnClientPostTick;
+                    _clientTickManager = null;
+                }
+
+                _serverTickManager = tickManager;
+                _isServerTicking = true;
+                _serverTickManager.onPreTick += OnServerPreTick;
+                _serverTickManager.onTick += OnServerTick;
+                _serverTickManager.onPostTick += OnServerPostTick;
+            }
+
+            if (modules.TryGetModule<BroadcastModule>(out var broadcastModule))
+            {
+                if (_clientBroadcast == broadcastModule)
+                    _clientBroadcast = null;
+                _serverBroadcast = broadcastModule;
+            }
+
+            if (modules.TryGetModule<AuthModule>(out var authModule))
+            {
+                if (_serverAuthModule != null)
+                    _serverAuthModule.onAuthenticationDenied -= OnAuthenticationDenied;
+                _serverAuthModule = authModule;
+                _serverAuthModule.onAuthenticationDenied += OnAuthenticationDenied;
+            }
+
+            if (modules.TryGetModule<PlayersManager>(out var playersManager))
+            {
+                if (_clientPlayersManager == playersManager)
+                {
+                    _clientPlayersManager.onPlayerJoined -= OnPlayerJoined;
+                    _clientPlayersManager.onPlayerLeft -= OnPlayerLeft;
+                    _clientPlayersManager.onLocalPlayerReceivedID -= OnLocalPlayerReceivedID;
+                    _clientPlayersManager = null;
+                }
+
+                _serverPlayersManager = playersManager;
+                _serverPlayersManager.onPlayerJoined += OnPlayerJoined;
+                _serverPlayersManager.onPlayerLeft += OnPlayerLeft;
+                _serverPlayersManager.onLocalPlayerReceivedID += OnLocalPlayerReceivedID;
+            }
+
+            if (modules.TryGetModule<PlayersBroadcaster>(out var playersBroadcast))
+            {
+                if (_clientPlayersBroadcast == playersBroadcast)
+                    _clientPlayersBroadcast = null;
+                _serverPlayersBroadcast = playersBroadcast;
+            }
+
+            if (modules.TryGetModule<ScenesModule>(out var scenesModule))
+            {
+                if (_clientSceneModule == scenesModule)
+                    _clientSceneModule = null;
+                _serverSceneModule = scenesModule;
+            }
+
+            if (modules.TryGetModule<ScenePlayersModule>(out var scenePlayers))
+            {
+                if (_clientScenePlayersModule == scenePlayers)
+                {
+                    _clientScenePlayersModule.onPlayerJoinedScene -= OnPlayerJoinedScene;
+                    _clientScenePlayersModule.onPlayerLoadedScene -= OnPlayerLoadedScene;
+                    _clientScenePlayersModule.onPlayerUnloadedScene -= OnPlayerUnloadedScene;
+                    _clientScenePlayersModule.onPlayerLeftScene -= OnPlayerLeftScene;
+                    _clientScenePlayersModule = null;
+                }
+
+                _serverScenePlayersModule = scenePlayers;
+                _serverScenePlayersModule.onPlayerJoinedScene += OnPlayerJoinedScene;
+                _serverScenePlayersModule.onPlayerLoadedScene += OnPlayerLoadedScene;
+                _serverScenePlayersModule.onPlayerUnloadedScene += OnPlayerUnloadedScene;
+                _serverScenePlayersModule.onPlayerLeftScene += OnPlayerLeftScene;
+            }
+
+            if (modules.TryGetModule<DeltaModule>(out var deltaModule))
+            {
+                if (_clientDeltaModule == deltaModule)
+                    _clientDeltaModule = null;
+                _serverDeltaModule = deltaModule;
+            }
+
+            if (modules.TryGetModule<RPCModule>(out var rpcModule))
+            {
+                if (_clientRpcModule == rpcModule)
+                    _clientRpcModule = null;
+                _serverRpcModule = rpcModule;
+            }
+
+            if (_onClientSpawnValidate != null && modules.TryGetModule<HierarchyFactory>(out var hierarchyFactory))
+            {
+                foreach (var del in _onClientSpawnValidate.GetInvocationList())
+                    hierarchyFactory.onClientSpawnValidate += (ValidateSpawnAction)del;
+            }
+
+            RenewSubscriptions(true);
         }
 
         private void OnServerPreTick() => onPreTick?.Invoke(true);
