@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using PurrNet.Logging;
+using PurrNet.Packing;
 using PurrNet.Pooling;
 using UnityEngine;
 using Object = UnityEngine.Object;
@@ -154,6 +155,57 @@ namespace PurrNet.Modules
             }
 
             return ids;
+        }
+
+        /// <summary>
+        /// Writes per-scene (identity -> owner) pairs for a relay snapshot. Consumed by
+        /// <see cref="RoomPersistenceModule"/>.
+        /// </summary>
+        internal void ExportSnapshot(BitPacker packer)
+        {
+            Packer<int>.Write(packer, _sceneOwnerships.Count);
+            foreach (var (scene, ownership) in _sceneOwnerships)
+            {
+                Packer<SceneID>.Write(packer, scene);
+                ownership.ExportSnapshot(packer);
+            }
+        }
+
+        /// <summary>
+        /// Restores ownership from a snapshot on the promoted host. Only entries whose identity
+        /// already exists on this host are re-attached; ids absent from the local hierarchy
+        /// (visibility-culled objects with no full-hierarchy snapshot yet) are skipped. The
+        /// whole stream is still read so it stays aligned.
+        /// </summary>
+        internal void ImportSnapshot(BitPacker packer)
+        {
+            int sceneCount = 0;
+            Packer<int>.Read(packer, ref sceneCount);
+
+            for (var s = 0; s < sceneCount; s++)
+            {
+                SceneID scene = default;
+                Packer<SceneID>.Read(packer, ref scene);
+
+                int ownerCount = 0;
+                Packer<int>.Read(packer, ref ownerCount);
+
+                _sceneOwnerships.TryGetValue(scene, out var ownership);
+
+                for (var i = 0; i < ownerCount; i++)
+                {
+                    NetworkID id = default;
+                    Packer<NetworkID>.Read(packer, ref id);
+                    PlayerID player = default;
+                    Packer<PlayerID>.Read(packer, ref player);
+
+                    if (ownership == null)
+                        continue;
+
+                    if (_hierarchy.TryGetIdentity(scene, id, out var identity) && identity)
+                        ownership.RestoreOwner(identity, player);
+                }
+            }
         }
 
         public bool PlayerOwnsSomething(PlayerID player)

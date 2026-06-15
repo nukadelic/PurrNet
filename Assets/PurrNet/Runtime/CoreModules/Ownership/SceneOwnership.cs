@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using PurrNet.Packing;
 
 namespace PurrNet.Modules
 {
@@ -35,6 +36,43 @@ namespace PurrNet.Modules
                     }
                 }
             }
+        }
+
+        /// <summary>Writes every (identity -> owner) pair in this scene for a relay snapshot.</summary>
+        internal void ExportSnapshot(BitPacker packer)
+        {
+            Packer<int>.Write(packer, _owners.Count);
+            foreach (var (id, player) in _owners)
+            {
+                Packer<NetworkID>.Write(packer, id);
+                Packer<PlayerID>.Write(packer, player);
+            }
+        }
+
+        /// <summary>
+        /// Re-establishes ownership of an existing identity from a snapshot on the promoted
+        /// host (server context): rebuilds the owner maps and re-seeds the server owner field,
+        /// mirroring <see cref="PromoteToServerModule"/> for entries the promoted host's own
+        /// replica was missing (e.g. visibility-culled or in-flight at host loss).
+        /// </summary>
+        internal void RestoreOwner(NetworkIdentity identity, PlayerID player)
+        {
+            if (!identity || !identity.id.HasValue)
+                return;
+
+            var id = identity.id.Value;
+            _owners[id] = player;
+
+            if (!_playerOwnedIds.TryGetValue(player, out var ownedIds))
+            {
+                ownedIds = new HashSet<NetworkID> { id };
+                _playerOwnedIds[player] = ownedIds;
+            }
+            else ownedIds.Add(id);
+
+            identity.internalOwnerServer = player;
+            identity.internalOwnerClient = null;
+            identity.RecacheHasConnectedOwner();
         }
 
         public List<OwnershipInfo> GetState()

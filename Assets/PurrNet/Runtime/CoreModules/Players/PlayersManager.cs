@@ -629,5 +629,71 @@ namespace PurrNet.Modules
         {
             _lastNidId[player] = lastNidID;
         }
+
+        /// <summary>
+        /// Writes the player-identity state needed to survive host migration: the id counter
+        /// and, per player, the session cookie + last reserved NetworkID. Consumed by
+        /// <see cref="RoomPersistenceModule"/> when capturing a relay snapshot.
+        /// </summary>
+        internal void ExportSnapshot(BitPacker packer)
+        {
+            Packer<ulong>.Write(packer, _playerIdCounter);
+
+            Packer<int>.Write(packer, _playerIdToCookie.Count);
+            foreach (var (playerId, cookie) in _playerIdToCookie)
+            {
+                Packer<PlayerID>.Write(packer, playerId);
+                Packer<string>.Write(packer, cookie);
+
+                bool hasNid = _lastNidId.TryGetValue(playerId, out var nid);
+                Packer<bool>.Write(packer, hasNid);
+                if (hasNid)
+                    Packer<NetworkID>.Write(packer, nid);
+            }
+        }
+
+        /// <summary>
+        /// Merges a snapshot's player-identity state into this (promoted) server. Existing
+        /// entries replicated via host-migration rules are overwritten with the authoritative
+        /// snapshot values, missing ones are added, and the id counter only ever grows. Must
+        /// run before reconnecting clients re-authenticate so their cookie maps back to the
+        /// original <see cref="PlayerID"/> (avoids minting a fresh id + duplicate character).
+        /// </summary>
+        internal void ImportSnapshot(BitPacker packer)
+        {
+            ulong counter = 0;
+            Packer<ulong>.Read(packer, ref counter);
+            if (counter > _playerIdCounter)
+                _playerIdCounter = counter;
+
+            int count = 0;
+            Packer<int>.Read(packer, ref count);
+            for (var i = 0; i < count; i++)
+            {
+                PlayerID playerId = default;
+                Packer<PlayerID>.Read(packer, ref playerId);
+
+                string cookie = null;
+                Packer<string>.Read(packer, ref cookie);
+
+                bool hasNid = false;
+                Packer<bool>.Read(packer, ref hasNid);
+                NetworkID nid = default;
+                if (hasNid)
+                    Packer<NetworkID>.Read(packer, ref nid);
+
+                if (!string.IsNullOrEmpty(cookie))
+                {
+                    _cookieToPlayerId[cookie] = playerId;
+                    _playerIdToCookie[playerId] = cookie;
+                }
+
+                if (hasNid)
+                    _lastNidId[playerId] = nid;
+
+                if (playerId.id.value > _playerIdCounter)
+                    _playerIdCounter = playerId.id.value;
+            }
+        }
     }
 }

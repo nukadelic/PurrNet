@@ -280,13 +280,29 @@ namespace PurrNet.Modules
         {
             if (isReconnect && !_manager.networkRules.ShouldRemovePlayerFromSceneOnLeave())
             {
-                /*foreach (var (scene, players) in _scenePlayers)
+                // Normally a reconnecting player is still in _scenePlayers (leave didn't remove
+                // them), so there's nothing to do. But a promoted host rebuilds its scene lists
+                // from only the players it had at promotion time — a player that (re)connects
+                // afterwards is missing, and with this early-return would never re-enter the
+                // scene, so it never reloads, never fires onPlayerLoadedScene, and never reclaims
+                // its character (it just loops reconnecting). Re-add it to any public scene it's
+                // not already in; AddPlayerToScene is a no-op (and fires no event) when present.
+                for (var i = 0; i < _scenes.scenes.Count; i++)
                 {
-                    if (players.Contains(player))
+                    var scene = _scenes.scenes[i];
+
+                    if (!_scenes.TryGetSceneState(scene, out var state))
                         continue;
 
-                    AddPlayerToScene
-                }*/
+                    if (!state.settings.isPublic)
+                        continue;
+
+                    if (IsPlayerInScene(player, scene))
+                        continue;
+
+                    AddPlayerToScene(player, scene);
+                }
+
                 return;
             }
 

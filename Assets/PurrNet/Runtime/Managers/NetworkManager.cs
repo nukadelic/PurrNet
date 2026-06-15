@@ -1287,6 +1287,10 @@ namespace PurrNet
             modules.AddModule(networkTransform);
             modules.AddModule(hierarchyV2);
             modules.AddModule(ownershipModule);
+            // Persistent-room snapshot capture/restore. Registered on both stacks (after the
+            // hierarchy + ownership modules so its promotion hooks run once those are set up) so
+            // the client instance is migrated onto a promoted host and restores there.
+            modules.AddModule(new RoomPersistenceModule(this, playersManager, ownershipModule));
             modules.AddModule(rpcModule);
             modules.AddModule(new RpcRequestResponseModule(this, playersManager, asServer));
             modules.AddModule(colliderRollback);
