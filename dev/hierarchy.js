@@ -223,6 +223,7 @@ var hierarchy =
       [ "PurrNet.Modules.PlayersManager", "classPurrNet_1_1Modules_1_1PlayersManager.html", null ],
       [ "PurrNet.Modules.RPCModule", "classPurrNet_1_1Modules_1_1RPCModule.html", null ],
       [ "PurrNet.Modules.RollbackModule", "classPurrNet_1_1Modules_1_1RollbackModule.html", null ],
+      [ "PurrNet.Modules.RoomPersistenceModule", "classPurrNet_1_1Modules_1_1RoomPersistenceModule.html", null ],
       [ "PurrNet.Modules.RpcRequestResponseModule", "classPurrNet_1_1Modules_1_1RpcRequestResponseModule.html", null ],
       [ "PurrNet.Modules.ScenePlayersModule", "classPurrNet_1_1Modules_1_1ScenePlayersModule.html", null ],
       [ "PurrNet.Modules.SceneScopedFactory< T >", "classPurrNet_1_1Modules_1_1SceneScopedFactory.html", null ],

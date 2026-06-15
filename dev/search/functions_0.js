@@ -5,5 +5,6 @@ var searchData=
   ['addprovider_2',['AddProvider',['../classPurrNet_1_1CompositePrefabProvider.html#acc5487aa7a6c541b64fd2c5bf7573639',1,'PurrNet::CompositePrefabProvider']]],
   ['addstate_3',['AddState',['../classPurrNet_1_1StateMachine_1_1StateMachine.html#a8ece992d3564f244d9f04a2e0a47374a',1,'PurrNet::StateMachine::StateMachine']]],
   ['addvisibilityrule_4',['AddVisibilityRule',['../classPurrNet_1_1NetworkManager.html#a1448bafa6c3157b487667ff30a125668',1,'PurrNet::NetworkManager']]],
-  ['advance_5',['Advance',['../classPurrNet_1_1SyncTimer.html#a7d8159162053902ea3ab33913a8f94a6',1,'PurrNet::SyncTimer']]]
+  ['advance_5',['Advance',['../classPurrNet_1_1SyncTimer.html#a7d8159162053902ea3ab33913a8f94a6',1,'PurrNet::SyncTimer']]],
+  ['applysnapshot_6',['ApplySnapshot',['../classPurrNet_1_1Modules_1_1RoomPersistenceModule.html#afdb86841afb034470f3339c2896f9d02',1,'PurrNet::Modules::RoomPersistenceModule']]]
 ];

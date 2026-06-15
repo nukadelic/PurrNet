@@ -64,6 +64,7 @@ var annotated_dup =
         [ "PurrSceneSettings", "structPurrNet_1_1Modules_1_1PurrSceneSettings.html", null ],
         [ "ReliableConnectionHistory", "classPurrNet_1_1Modules_1_1ReliableConnectionHistory.html", null ],
         [ "RollbackModule", "classPurrNet_1_1Modules_1_1RollbackModule.html", null ],
+        [ "RoomPersistenceModule", "classPurrNet_1_1Modules_1_1RoomPersistenceModule.html", "classPurrNet_1_1Modules_1_1RoomPersistenceModule" ],
         [ "RPCBatch", "classPurrNet_1_1Modules_1_1RPCBatch.html", null ],
         [ "RPCModule", "classPurrNet_1_1Modules_1_1RPCModule.html", null ],
         [ "RPCPacketPacker", "structPurrNet_1_1Modules_1_1RPCPacketPacker.html", null ],

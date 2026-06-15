@@ -1,5 +1,13 @@
 var NAVTREEINDEX7 =
 {
+"structPurrNet_1_1Packing_1_1QuaternionEqualityComparer.html":[0,0,0,5,36],
+"structPurrNet_1_1Packing_1_1Size.html":[0,0,0,5,38],
+"structPurrNet_1_1Packing_1_1Size.html":[1,0,0,5,38],
+"structPurrNet_1_1PlayerID.html":[0,0,0,92],
+"structPurrNet_1_1PlayerID.html":[1,0,0,92],
+"structPurrNet_1_1PoolingConfig.html":[0,0,0,96],
+"structPurrNet_1_1PoolingConfig.html":[1,0,0,96],
+"structPurrNet_1_1Pooling_1_1AllocationDetails.html":[0,0,0,6,0],
 "structPurrNet_1_1Pooling_1_1AllocationDetails.html":[1,0,0,6,0],
 "structPurrNet_1_1Pooling_1_1DisposableArray.html":[1,0,0,6,3],
 "structPurrNet_1_1Pooling_1_1DisposableArray.html":[0,0,0,6,3],
